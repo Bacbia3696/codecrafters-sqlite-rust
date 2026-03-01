@@ -8,4 +8,5 @@ rust-version = "1.91"
 [dependencies]
 anyhow = "1.0.68"                                # error handling
 bytes = "1.3.0"                                  # helps manage buffers
+clap = { version = "4", features = ["derive"] }  # command-line argument parsing
 thiserror = "1.0.38"                             # error handling
