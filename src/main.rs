@@ -1,10 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::fs::File;
-use std::io::prelude::*;
+use std::io::{Read, Seek};
 
-/// Read a varint from data starting at offset
-/// Returns (value, bytes_read)
 fn read_varint(data: &[u8], offset: usize) -> (u64, usize) {
     let mut result: u64 = 0;
     let mut bytes_read = 0;
@@ -17,15 +15,11 @@ fn read_varint(data: &[u8], offset: usize) -> (u64, usize) {
         bytes_read += 1;
 
         if i < 8 {
-            // First 8 bytes: use lower 7 bits
             result = (result << 7) | ((byte & 0x7F) as u64);
-
-            // If high bit is 0, this is the last byte
             if byte & 0x80 == 0 {
                 break;
             }
         } else {
-            // 9th byte: use all 8 bits
             result = (result << 8) | (byte as u64);
         }
     }
@@ -33,20 +27,95 @@ fn read_varint(data: &[u8], offset: usize) -> (u64, usize) {
     (result, bytes_read)
 }
 
+fn read_page_size(header: &[u8]) -> usize {
+    u16::from_be_bytes([header[16], header[17]]) as usize
+}
+
+fn read_first_page(file: &mut File) -> Result<Vec<u8>> {
+    let mut header = [0; 100];
+    file.read_exact(&mut header)?;
+    let page_size = read_page_size(&header);
+
+    let mut page = vec![0u8; page_size];
+    page[..100].copy_from_slice(&header);
+    file.read_exact(&mut page[100..])?;
+    Ok(page)
+}
+
+fn get_cell_offsets(page: &[u8]) -> Vec<usize> {
+    let cell_count = u16::from_be_bytes([page[103], page[104]]) as usize;
+    (0..cell_count)
+        .map(|i| {
+            let offset = 108 + i * 2;
+            u16::from_be_bytes([page[offset], page[offset + 1]]) as usize
+        })
+        .collect()
+}
+
+/// Returns the size in bytes for a given SQLite serial type.
+///
+/// SQLite uses a dynamic type system where each value carries its own type information.
+/// The serial type tells us both the data type and how many bytes it occupies.
+///
+/// ## Serial Type Reference
+///
+/// | Serial Type | Size        | Description                    |
+/// |-------------|-------------|--------------------------------|
+/// | 0           | 0 bytes     | NULL                           |
+/// | 1           | 1 byte      | 8-bit signed integer           |
+/// | 2           | 2 bytes     | 16-bit signed integer (BE)     |
+/// | 3           | 3 bytes     | 24-bit signed integer (BE)     |
+/// | 4           | 4 bytes     | 32-bit signed integer (BE)     |
+/// | 5           | 6 bytes     | 48-bit signed integer (BE)     |
+/// | 6           | 8 bytes     | 64-bit signed integer (BE)     |
+/// | 7           | 8 bytes     | IEEE 754 float (BE)            |
+/// | 8           | 0 bytes     | Integer constant 0             |
+/// | 9           | 0 bytes     | Integer constant 1             |
+/// | ≥12, even   | (n-12)/2    | BLOB of that many bytes        |
+/// | ≥13, odd    | (n-13)/2    | TEXT of that many bytes        |
+///
+/// ## Examples
+///
+/// ```text
+/// Serial type 13 → (13-13)/2 = 0 bytes  → empty string
+/// Serial type 15 → (15-13)/2 = 1 byte   → 1-char string
+/// Serial type 25 → (25-13)/2 = 6 bytes  → "apples"
+/// Serial type 12 → (12-12)/2 = 0 bytes  → empty blob
+/// Serial type 14 → (14-12)/2 = 1 byte   → 1-byte blob
+/// ```
+fn serial_type_size(st: u64) -> usize {
+    match st {
+        // NULL, or special integers 0 and 1 (stored as constants, no bytes needed)
+        0 | 8 | 9 => 0,
+        // Fixed-size integers: 1, 2, 3, 4, or 6 bytes
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        // 8-byte values: signed int or float
+        6 | 7 => 8,
+        // TEXT: odd serial types ≥ 13, length = (st - 13) / 2
+        st if st >= 13 && st % 2 == 1 => ((st - 13) / 2) as usize,
+        // BLOB: even serial types ≥ 12, length = (st - 12) / 2
+        st if st >= 12 && st % 2 == 0 => ((st - 12) / 2) as usize,
+        // Reserved or unknown serial types treated as 0 bytes
+        _ => 0,
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "sqlite")]
 #[command(about = "A SQLite database CLI tool")]
 struct Cli {
-    /// Path to the SQLite database file
     database: String,
-
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+    query: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Display database information
     #[command(name = ".dbinfo")]
     Dbinfo,
     #[command(name = ".tables")]
@@ -57,67 +126,35 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Dbinfo => {
+        Some(Commands::Dbinfo) => {
             let mut file = File::open(&cli.database)?;
-
-            // Read the file header (100 bytes) + page header (5 bytes to reach cell count)
             let mut header = [0; 105];
             file.read_exact(&mut header)?;
 
-            // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
-            let page_size = u16::from_be_bytes([header[16], header[17]]);
-
-            // The cell count is at offset 103 (100 byte file header + 3 bytes into page header)
-            // It's a 2-byte big-endian value
-            let cell_count = u16::from_be_bytes([header[103], header[104]]);
-
-            println!("database page size: {}", page_size);
-            println!("number of tables: {}", cell_count);
+            println!("database page size: {}", read_page_size(&header));
+            println!(
+                "number of tables: {}",
+                u16::from_be_bytes([header[103], header[104]])
+            );
         }
-        Commands::Tables => {
+        Some(Commands::Tables) => {
             let mut file = File::open(&cli.database)?;
-            let mut header = [0; 100];
-            file.read_exact(&mut header)?;
-            let page_size = u16::from_be_bytes([header[16], header[17]]) as usize;
+            let page1 = read_first_page(&mut file)?;
 
-            // Read entire page 1
-            let mut page1 = vec![0u8; page_size];
-            page1[..100].copy_from_slice(&header);
-            file.read_exact(&mut page1[100..])?;
-
-            // Get cell count and cell offsets
-            let cell_count = u16::from_be_bytes([page1[103], page1[104]]) as usize;
-            let mut cell_offsets = Vec::with_capacity(cell_count);
-            for i in 0..cell_count {
-                let offset = 108 + i * 2;
-                let cell_offset = u16::from_be_bytes([page1[offset], page1[offset + 1]]) as usize;
-                cell_offsets.push(cell_offset);
-            }
-
-            // Parse each cell to extract tbl_name (column 2)
-            //sqlite3 test.db ".schema sqlite_schema"
-            // CREATE TABLE sqlite_schema (
-            //   type text,
-            //   name text,
-            //   tbl_name text,
-            //   rootpage integer,
-            //   sql text
-            // );
-            for cell_offset in cell_offsets {
+            for cell_offset in get_cell_offsets(&page1) {
                 let mut offset = cell_offset;
 
-                // Skip payload size and rowid (both varints)
+                // Skip payload size and rowid
                 let (_, bytes) = read_varint(&page1, offset);
                 offset += bytes;
                 let (_, bytes) = read_varint(&page1, offset);
                 offset += bytes;
 
-                // Read header size
+                // Read serial types
                 let (header_size, bytes) = read_varint(&page1, offset);
                 let header_start = offset;
                 offset += bytes;
 
-                // Read serial types for columns 0, 1, 2 (type, name, tbl_name)
                 let mut serial_types = Vec::new();
                 while offset < header_start + header_size as usize {
                     let (serial_type, bytes) = read_varint(&page1, offset);
@@ -125,26 +162,83 @@ fn main() -> Result<()> {
                     offset += bytes;
                 }
 
-                // Skip column 0 (type) and column 1 (name) - both are TEXT
-                // Serial type for TEXT: n >= 13 and odd, length = (n-13)/2
-                for i in 0..2 {
-                    let st = serial_types[i as usize];
-                    if st >= 13 && st % 2 == 1 {
-                        let len = ((st - 13) / 2) as usize;
-                        offset += len; // Skip this column's data
-                    }
-                }
+                // Skip first two columns, read third (table name)
+                offset += serial_types[0..2]
+                    .iter()
+                    .map(|&st| serial_type_size(st))
+                    .sum::<usize>();
 
-                // Read column 2 (tbl_name) - also TEXT
-                let st = serial_types[2];
-                if st >= 13 && st % 2 == 1 {
-                    let len = ((st - 13) / 2) as usize;
-                    let tbl_name = String::from_utf8_lossy(&page1[offset..offset + len]);
-                    println!("{}", tbl_name);
+                let len = serial_type_size(serial_types[2]);
+                if len > 0 {
+                    println!("{}", String::from_utf8_lossy(&page1[offset..offset + len]));
                 }
+            }
+        }
+        None => {
+            if let Some(query) = cli.query {
+                let table_name = query.split_whitespace().last().unwrap();
+                let mut file = File::open(&cli.database)?;
+                let page1 = read_first_page(&mut file)?;
+                let page_size = page1.len();
+
+                let rootpage = find_rootpage(&page1, table_name)?;
+                file.seek(std::io::SeekFrom::Start(
+                    (rootpage - 1) as u64 * page_size as u64,
+                ))?;
+
+                let mut page = vec![0u8; page_size];
+                file.read_exact(&mut page)?;
+
+                println!("{}", u16::from_be_bytes([page[3], page[4]]));
+            } else {
+                println!("No command or query provided. Use --help for usage information.");
             }
         }
     }
 
     Ok(())
+}
+
+fn find_rootpage(page1: &[u8], target_table: &str) -> Result<u32> {
+    for cell_offset in get_cell_offsets(page1) {
+        let mut offset = cell_offset;
+
+        // Skip payload size and rowid
+        let (_, bytes) = read_varint(page1, offset);
+        offset += bytes;
+        let (_, bytes) = read_varint(page1, offset);
+        offset += bytes;
+
+        // Read serial types
+        let (header_size, bytes) = read_varint(page1, offset);
+        let header_start = offset;
+        offset += bytes;
+
+        let mut serial_types = Vec::new();
+        while offset < header_start + header_size as usize {
+            let (st, bytes) = read_varint(page1, offset);
+            serial_types.push(st);
+            offset += bytes;
+        }
+
+        // Parse columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
+        offset += serial_type_size(serial_types[0]); // Skip type column
+
+        let name_len = serial_type_size(serial_types[1]);
+        let name = String::from_utf8_lossy(&page1[offset..offset + name_len]).to_string();
+        offset += name_len;
+
+        offset += serial_type_size(serial_types[2]); // Skip tbl_name column
+
+        let rootpage_size = serial_type_size(serial_types[3]);
+        let rootpage = page1[offset..offset + rootpage_size]
+            .iter()
+            .fold(0u32, |acc, &b| (acc << 8) | b as u32);
+
+        if name == target_table {
+            return Ok(rootpage);
+        }
+    }
+
+    anyhow::bail!("Table '{}' not found", target_table)
 }
